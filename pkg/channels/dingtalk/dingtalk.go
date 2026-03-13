@@ -35,6 +35,8 @@ type DingTalkChannel struct {
 	sessionWebhooks sync.Map // chatID -> sessionWebhook
 	// chatID -> cardInstanceID
 	cardInstanceIDs sync.Map
+
+	replier *chatbot.ChatbotReplier
 }
 
 // NewDingTalkChannel creates a new DingTalk channel instance
@@ -63,6 +65,7 @@ func NewDingTalkChannel(cfg config.DingTalkConfig, messageBus *bus.MessageBus) (
 		clientID:     cfg.ClientID,
 		clientSecret: cfg.ClientSecret,
 		client:       dingTalkClient,
+		replier:      chatbot.NewChatbotReplier(),
 	}, nil
 }
 
@@ -117,7 +120,7 @@ func (c *DingTalkChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 		return channels.ErrNotRunning
 	}
 	// Check if we have a card instance ID for this chat (indicating we can send a card reply)
-	cardInstanceIDRaw, ok := c.cardInstanceIDs.Load(msg.ChatID)
+	cardInstanceIDRaw, ok := c.cardInstanceIDs.LoadAndDelete(msg.ChatID)
 	if !ok {
 		return c.SendDirectReply(ctx, msg)
 	}
@@ -135,21 +138,18 @@ func (c *DingTalkChannel) onChatBotMessageReceived(
 	ctx context.Context,
 	data *chatbot.BotCallbackDataModel,
 ) ([]byte, error) {
-	// Extract message content from Text field
-	content := data.Text.Content
-	if content == "" {
-		// Try to extract from Content interface{} if Text is empty
-		if contentMap, ok := data.Content.(map[string]any); ok {
-			if textContent, ok := contentMap["content"].(string); ok {
-				content = textContent
-			}
-		}
+
+	parser, err := NewMessageParser(c.client, data)
+	if err != nil {
+		logger.ErrorCF("dingtalk", "parser message error", map[string]any{
+			"error":     err.Error(),
+			"sender_id": data.SenderId,
+		})
+		return nil, c.replier.SimpleReplyText(ctx, data.SessionWebhook,
+			[]byte(fmt.Sprintf("Sorry, I couldn't process your %s message. Please try again.", data.Msgtype)))
 	}
 
-	if content == "" {
-		return nil, nil // Ignore empty messages
-	}
-
+	content, media := parser.Parser()
 	senderID := data.SenderStaffId
 	senderNick := data.SenderNick
 	chatID := senderID
@@ -197,19 +197,21 @@ func (c *DingTalkChannel) onChatBotMessageReceived(
 		return nil, nil
 	}
 
-	// Try to create and deliver card (optional feature)
-	// If it fails, log the error but continue with normal message handling
-	if err := c.tryCardCreateAndDeliver(ctx, chatID, data); err != nil {
+	// try to create and deliver a card. If it fails, fall back to direct reply and store the session webhook for later
+	// use when sending the reply
+	if err := c.tryCardCreateAndDeliver(ctx, data.MsgId, data); err != nil {
 		logger.WarnCF("dingtalk", "Failed to create or deliver card, falling back to direct reply", map[string]any{
 			"error":     err.Error(),
 			"chat_id":   chatID,
 			"sender_id": senderID,
 		})
+		// Store the session webhook for this chat so we can reply later
+		c.sessionWebhooks.Store(chatID, data.SessionWebhook)
+	} else {
+		chatID = data.MsgId
 	}
-	// Store the session webhook for this chat so we can reply later
-	c.sessionWebhooks.Store(chatID, data.SessionWebhook)
 	// Handle the message through the base channel
-	c.HandleMessage(ctx, peer, "", senderID, chatID, content, nil, metadata, sender)
+	c.HandleMessage(ctx, peer, "", senderID, chatID, content, media, metadata, sender)
 
 	// Return nil to indicate we've handled the message asynchronously
 	// The response will be sent through the message bus
@@ -232,23 +234,18 @@ func (c *DingTalkChannel) SendDirectReply(ctx context.Context, msg bus.OutboundM
 		"chat_id": msg.ChatID,
 		"preview": utils.Truncate(msg.Content, 100),
 	})
+	return c.SimpleReplyMarkdown(ctx, sessionWebhook, "PicoClaw", msg.Content)
+}
+
+func (c *DingTalkChannel) SimpleReplyMarkdown(ctx context.Context, sessionWebhook, title, content string) error {
 	replier := chatbot.NewChatbotReplier()
-
-	// Convert string content to []byte for the API
-	contentBytes := []byte(msg.Content)
-	titleBytes := []byte("PicoClaw")
-
 	// Send markdown formatted reply
-	err := replier.SimpleReplyMarkdown(
+	return replier.SimpleReplyMarkdown(
 		ctx,
 		sessionWebhook,
-		titleBytes,
-		contentBytes,
+		[]byte(title),
+		[]byte(content),
 	)
-	if err != nil {
-		return fmt.Errorf("dingtalk send: %w", channels.ErrTemporary)
-	}
-	return nil
 }
 
 func (c *DingTalkChannel) SendCardReply(ctx context.Context, cardInstanceID, content string) error {
@@ -257,7 +254,7 @@ func (c *DingTalkChannel) SendCardReply(ctx context.Context, cardInstanceID, con
 
 func (c *DingTalkChannel) tryCardCreateAndDeliver(
 	ctx context.Context,
-	chatID string,
+	msgID string,
 	data *chatbot.BotCallbackDataModel,
 ) error {
 	if c.config.CardTemplateID == "" {
@@ -267,6 +264,6 @@ func (c *DingTalkChannel) tryCardCreateAndDeliver(
 	if err != nil {
 		return err
 	}
-	c.cardInstanceIDs.Store(chatID, cardInstanceID)
+	c.cardInstanceIDs.Store(msgID, cardInstanceID)
 	return nil
 }

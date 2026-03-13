@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
+
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 const (
@@ -22,9 +23,11 @@ const (
 	cardStreaming        = "/v1.0/card/streaming"
 	privateChatMessages  = "/v1.0/robot/privateChatMessages/send"
 	batchSendMessages    = "/v1.0/robot/oToMessages/batchSend"
+	messageFilesDownload = "/v1.0/robot/messageFiles/download"
 )
 
-// MessageType represents the type of message to be sent.
+// MessageType represents the type of message to be sent to DingTalk. It can be one of the following:
+// https://open.dingtalk.com/document/dingstart/types-of-messages-sent-by-robots#9c212e87342hn
 type MessageType string
 
 func (t MessageType) String() string {
@@ -84,12 +87,8 @@ func (c *Client) GetToken(ctx context.Context) (string, error) {
 		"appKey":    c.clientID,
 		"appSecret": c.clientSecret,
 	}
-	resp := struct {
-		Expires int64  `json:"expireIn"`
-		Token   string `json:"accessToken"`
-	}{}
-	err := c.httpRequest(ctx, http.MethodPost, accessToken, data, &resp)
-	if err != nil {
+	resp := &AccessTokenResponse{}
+	if err := c.httpRequest(ctx, http.MethodPost, accessToken, data, resp); err != nil {
 		return "", err
 	}
 	c.expires = time.Now().Add(time.Second * time.Duration(resp.Expires))
@@ -170,41 +169,8 @@ func (c *Client) CardCreateAndDeliver(ctx context.Context, chatbot *chatbot.BotC
 		"imRobotOpenSpaceModel":   imRobotOpenSpaceModel,
 		"imRobotOpenDeliverModel": imRobotOpenDeliverModel,
 	}
-	/**
-	{
-	  "result" : {
-	    "deliverResults" : [ {
-	      "spaceId" : "manager164",
-	      "spaceType" : "IM_ROBOT",
-	      "success" : true,
-	      "carrierId" : "119X11tauuJlODPiK0wpCjIXPcGpODOnnpHc/uYFFnI=",
-	      "errorMsg" : ""
-	    } ],
-	    "outTrackId" : "f51222b2-1aff-11f1-8a7c-a40c662198be"
-	  },
-	  "success" : true
-	}
-	*/
-	resp := struct {
-		Result struct {
-			DeliverResults []struct {
-				SpaceID   string `json:"spaceId"`
-				SpaceType string `json:"spaceType"`
-				Success   bool   `json:"success"`
-				CarrierID string `json:"carrierId"`
-				ErrorMsg  string `json:"errorMsg"`
-			} `json:"deliverResults"`
-			OutTrackID string `json:"outTrackId"`
-		} `json:"result"`
-		Success bool `json:"success"`
-	}{}
-	if err = c.httpRequest(ctx, http.MethodPost, createCardAndDeliver, body, &resp); err != nil {
-		return "", err
-	}
-	if resp.Success {
-		return resp.Result.OutTrackID, nil
-	}
-	return "", errors.New("failed to create and deliver card instance")
+	resp := &CardCreateAndDeliverResponse{}
+	return resp.Result.OutTrackID, c.httpRequest(ctx, http.MethodPost, createCardAndDeliver, body, resp)
 }
 
 // PrivateChatMessages sends a message to a user in a private chat.
@@ -220,6 +186,17 @@ func (c *Client) PrivateChatMessages(
 		"robotCode":          c.robotCode,
 	}
 	return c.httpRequest(ctx, http.MethodPost, privateChatMessages, body, nil)
+}
+
+//MessageFilesDownload download message files
+// https://open.dingtalk.com/document/development/download-the-file-content-of-the-robot-receiving-message
+func (c *Client) MessageFilesDownload(downloadCode string) (string, error) {
+	body := map[string]any{
+		"downloadCode": downloadCode,
+		"robotCode":    c.robotCode,
+	}
+	resp := &MessageFilesDownloadResponse{}
+	return resp.DownloadUrl, c.httpRequest(context.Background(), http.MethodPost, messageFilesDownload, body, resp)
 }
 
 func (c *Client) buildSendMessages(msgType MessageType, content string) string {
@@ -239,12 +216,13 @@ func (c *Client) buildSendMessages(msgType MessageType, content string) string {
 	return string(msg)
 }
 
-func (c *Client) httpRequest(ctx context.Context, method, path string, body any, resp any) error {
+func (c *Client) httpRequest(ctx context.Context, method, path string, body any, resp Unmarshalled) error {
 	var (
 		err   error
 		token string
-		req   *http.Request
+		data  []byte
 		hc    = c.client
+		req   *http.Request
 		res   *http.Response
 	)
 	if path == accessToken {
@@ -257,7 +235,7 @@ func (c *Client) httpRequest(ctx context.Context, method, path string, body any,
 	}
 	url := endpoint + path
 	if body != nil {
-		data, _ := json.Marshal(body)
+		data, _ = json.Marshal(body)
 		req, err = http.NewRequestWithContext(ctx, method, url, bytes.NewReader(data))
 	} else {
 		req, err = http.NewRequestWithContext(ctx, method, url, nil)
@@ -269,17 +247,32 @@ func (c *Client) httpRequest(ctx context.Context, method, path string, body any,
 	if token != "" {
 		req.Header.Set("X-Acs-Dingtalk-Access-Token", token)
 	}
-	res, err = hc.Do(req)
-	if err != nil {
+	if res, err = hc.Do(req); err != nil {
+		logger.ErrorCF("dingtalk", "dingtalk http request error", map[string]any{
+			"url":    url,
+			"method": method,
+		})
 		return err
-	}
-	defer res.Body.Close()
-	data, err := io.ReadAll(res.Body)
-	if res.StatusCode != http.StatusOK || err != nil {
-		return fmt.Errorf("API request failed:\n  Status: %d\n  Body:   %s", res.StatusCode, string(data))
 	}
 	if resp == nil {
 		return nil
 	}
-	return json.Unmarshal(data, resp)
+	defer res.Body.Close()
+	if data, err = io.ReadAll(res.Body); err != nil {
+		logger.ErrorCF("dingtalk", "dingtalk http response read error", map[string]any{
+			"url":    url,
+			"status": res.Status,
+			"body":   string(data),
+		})
+		return err
+	}
+	if err = json.Unmarshal(data, resp); err != nil {
+		logger.ErrorCF("dingtalk", "dingtalk http response Unmarshal error", map[string]any{
+			"url":    url,
+			"status": res.Status,
+			"body":   string(data),
+		})
+		return err
+	}
+	return resp.CheckError()
 }
